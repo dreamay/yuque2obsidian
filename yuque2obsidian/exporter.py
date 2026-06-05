@@ -205,6 +205,19 @@ class Exporter:
     ) -> None:
         detail = await self.api.get_doc_detail(repo.namespace, summary.slug)
 
+        # For Lake-format docs, try the unofficial web API first – it returns
+        # server-converted Markdown which is usually much cleaner than local
+        # HTML→Markdown conversion.
+        if detail.format and detail.format.lower() == "lake" and detail.book_id:
+            web_md = await self.api.get_doc_markdown_via_web_api(
+                detail.slug, detail.book_id
+            )
+            if web_md is not None:
+                detail.body = web_md
+                logger.debug(
+                    "Using web API markdown for lake doc %s/%s", repo.namespace, detail.slug
+                )
+
         rel_path = toc_tree.doc_file_path(
             detail.id,
             detail.title or detail.slug,

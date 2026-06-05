@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import html
+import json
 import logging
 import os
 import re
@@ -13,6 +14,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 import httpx
+import markdownify
 
 from yuque2obsidian.config import Config
 from yuque2obsidian.models import DocDetail
@@ -304,38 +306,18 @@ def _convert_html_tables(text: str) -> str:
     return HTML_TABLE_RE.sub(_table_repl, text)
 
 
-def _basic_html_to_markdown(html_text: str) -> str:
-    """Lightweight HTML → Markdown converter for lake *body_html* fallback."""
-    text = html_text
-    # Strip script / style blocks completely.
-    text = re.sub(r'<script[^>]*>.*?</script>', '', text, flags=re.DOTALL | re.IGNORECASE)
-    text = re.sub(r'<style[^>]*>.*?</style>', '', text, flags=re.DOTALL | re.IGNORECASE)
-    # Headings
-    for i in range(6, 0, -1):
-        text = re.sub(rf'<h{i}[^>]*>(.*?)</h{i}>', rf'{"#" * i} \1\n\n', text, flags=re.DOTALL | re.IGNORECASE)
-    # Bold / italic
-    text = re.sub(r'<(?:strong|b)[^>]*>(.*?)</(?:strong|b)>', r'**\1**', text, flags=re.DOTALL | re.IGNORECASE)
-    text = re.sub(r'<(?:em|i)[^>]*>(.*?)</(?:em|i)>', r'*\1*', text, flags=re.DOTALL | re.IGNORECASE)
-    # Code blocks (pre + code)
-    text = re.sub(r'<pre[^>]*>\s*<code[^>]*>(.*?)</code>\s*</pre>', r'```\n\1\n```\n\n', text, flags=re.DOTALL | re.IGNORECASE)
-    # Inline code
-    text = re.sub(r'<code[^>]*>(.*?)</code>', r'`\1`', text, flags=re.DOTALL | re.IGNORECASE)
-    # Paragraphs
-    text = re.sub(r'<p[^>]*>(.*?)</p>', r'\1\n\n', text, flags=re.DOTALL | re.IGNORECASE)
-    # Line breaks
-    text = re.sub(r'<br\s*/?>', '\n', text, flags=re.IGNORECASE)
-    # Lists
-    text = re.sub(r'<li[^>]*>(.*?)</li>', r'- \1', text, flags=re.DOTALL | re.IGNORECASE)
-    text = re.sub(r'</?ul[^>]*>|</?ol[^>]*>', '', text, flags=re.IGNORECASE)
-    # Images (already handled by ResourceDownloader, but strip alt/src noise)
-    text = re.sub(r'<img[^>]*>', '', text, flags=re.IGNORECASE)
-    # Strip remaining tags
-    text = HTML_TAG_RE.sub('', text)
-    # Unescape
-    text = html.unescape(text)
-    # Collapse excessive blank lines
-    text = re.sub(r'\n{3,}', '\n\n', text)
-    return text.strip()
+def _markdownify_html(html_text: str) -> str:
+    """Convert HTML to Markdown using markdownify (handles complex HTML well)."""
+    # markdownify uses BeautifulSoup under the hood and produces high-quality
+    # Markdown for headings, lists, tables, code blocks, emphasis, etc.
+    md = markdownify.markdownify(
+        html_text,
+        heading_style="ATX",
+        strip=["script", "style"],
+    )
+    # Collapse excessive blank lines.
+    md = re.sub(r"\n{3,}", "\n\n", md)
+    return md.strip()
 
 
 def _handle_lake_cards(text: str, namespace: str, slug: str) -> str:
@@ -364,28 +346,93 @@ def convert_lake_body(
     """Convert lake-format document body to Obsidian-compatible Markdown.
 
     Strategy:
-    1. Handle known lake cards (board / mind-map) → placeholders.
-    2. Convert any embedded HTML tables → Markdown tables.
-    3. If *body* is very short / empty and *body_html* is present, do a basic
-       HTML → Markdown conversion as fallback.
+    1. Replace lake cards (board / mind-map) with placeholders first, before
+       any HTML→Markdown conversion, so the placeholders survive intact.
+    2. If the body is short or contains heavy HTML, convert *body_html* (or
+       the body itself) with markdownify for high-quality Markdown output.
+    3. Post-process HTML tables that markdownify may not handle perfectly.
+    4. Detect lakesheet (data-table) JSON payloads and convert them.
     """
     if not body:
         body = ''
 
-    # Step 1: lake cards
+    # Step 1: lakesheet JSON detection
+    # Yuque sometimes embeds sheet data as a JSON blob in the body.
+    _sheet_json = _try_extract_lakesheet(body)
+    if _sheet_json is not None:
+        return _sheet_json
+
+    # Step 2: replace known lake cards with placeholders
     body = _handle_lake_cards(body, namespace, slug)
 
-    # Step 2: HTML tables inside markdown body
-    body = _convert_html_tables(body)
+    # Step 3: decide whether we need heavy HTML→Markdown conversion
+    # Heuristic: body is very short, or body contains significant HTML markup.
+    body_stripped = body.strip()
+    has_substantial_html = body.count('<') > 5 and '<div' in body.lower()
+    needs_conversion = len(body_stripped) < 100 or has_substantial_html
 
-    # Step 3: fallback to body_html when body is basically empty
-    if body_html and len(body.strip()) < 100:
-        body = _basic_html_to_markdown(body_html)
-        # Re-apply table conversion on the converted text as well.
-        body = _convert_html_tables(body)
+    if needs_conversion and body_html:
+        # Use markdownify for robust HTML→Markdown conversion.
+        body = _markdownify_html(body_html)
+        # Re-apply card placeholders (markdownify preserves blockquote text).
         body = _handle_lake_cards(body, namespace, slug)
 
+    # Step 4: fix up tables that markdownify may have left with quirks
+    body = _convert_html_tables(body)
+
     return body
+
+
+def _try_extract_lakesheet(body: str) -> Optional[str]:
+    """Detect and convert a lakesheet (data-table) JSON payload to Markdown.
+
+    Yuque lakesheet documents sometimes store the table data as JSON inside
+    the body.  If we find a recognisable sheet structure we convert it to a
+    Markdown table; otherwise return None so normal processing continues.
+    """
+    text = body.strip()
+    if not text.startswith('{'):
+        return None
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+
+    # Look for sheet data in a few known shapes.
+    sheet = data.get('sheet') or data.get('data', {}).get('sheet')
+    if not sheet:
+        return None
+
+    # sheet may be a dict with headers + rows, or a list of rows.
+    headers: list[str] = []
+    rows: list[list[str]] = []
+
+    if isinstance(sheet, dict):
+        headers = [str(h) for h in sheet.get('header', [])]
+        for row in sheet.get('rows', []):
+            if isinstance(row, dict):
+                rows.append([str(row.get(h, '')) for h in headers])
+            elif isinstance(row, list):
+                rows.append([str(c) for c in row])
+    elif isinstance(sheet, list) and sheet:
+        first = sheet[0]
+        if isinstance(first, dict):
+            headers = list(first.keys())
+            for row in sheet:
+                rows.append([str(row.get(h, '')) for h in headers])
+        elif isinstance(first, list):
+            headers = [str(c) for c in first]
+            for row in sheet[1:]:
+                rows.append([str(c) for c in row])
+
+    if not headers:
+        return None
+
+    lines = ['| ' + ' | '.join(headers) + ' |']
+    lines.append('| ' + ' | '.join(['---'] * len(headers)) + ' |')
+    for row in rows:
+        lines.append('| ' + ' | '.join(row) + ' |')
+    return '\n'.join(lines) + '\n'
 
 
 # ---------------------------------------------------------------------------

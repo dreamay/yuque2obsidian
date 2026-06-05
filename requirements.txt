@@ -7,3 +7,5 @@ gradio>=4.0.0
 huggingface-hub<0.25
 python-slugify>=8.0.0
 tenacity>=8.0.0
+markdownify>=0.14.0
+beautifulsoup4>=4.12.0

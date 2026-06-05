@@ -186,3 +186,66 @@ class YuqueAPI:
     async def get_doc_detail(self, namespace: str, slug: str) -> DocDetail:
         data = await self.request("GET", f"/repos/{namespace}/docs/{slug}")
         return DocDetail.model_validate(data)
+
+    # ------------------------------------------------------------------
+    # Unofficial web API fallback (for Lake → Markdown server conversion)
+    # ------------------------------------------------------------------
+
+    async def get_doc_markdown_via_web_api(
+        self, slug: str, book_id: int
+    ) -> Optional[str]:
+        """Try to fetch pre-converted Markdown from the unofficial web API.
+
+        The unofficial endpoint ``/api/docs/{slug}?book_id={id}&mode=markdown``
+        asks Yuque to convert the document (including Lake format) to Markdown
+        on the server side.  This often produces cleaner output than local
+        HTML→Markdown conversion.
+
+        Authentication: this endpoint historically requires a web session
+        (cookie).  The Token used for API v2 may or may not work here, so we
+        try gracefully and return *None* on any failure so the caller can
+        fall back to the official ``body`` / ``body_html`` fields.
+        """
+        url = f"https://www.yuque.com/api/docs/{slug}"
+        params = {
+            "book_id": str(book_id),
+            "merge_dynamic_data": "false",
+            "mode": "markdown",
+        }
+        async with self.semaphore:
+            await self.rate_limiter.acquire()
+            try:
+                response = await self.client.get(url, params=params)
+                response.raise_for_status()
+                payload = response.json()
+                data = payload.get("data", {})
+                # The server-converted Markdown lives in ``sourcecode``.
+                source = data.get("sourcecode")
+                if isinstance(source, str) and source.strip():
+                    logger.debug(
+                        "Web API markdown fallback succeeded for doc %s (book_id=%s)",
+                        slug,
+                        book_id,
+                    )
+                    return source
+            except httpx.HTTPStatusError as exc:
+                # 401/403 means the Token doesn't work for the web API.
+                if exc.response.status_code in (401, 403):
+                    logger.debug(
+                        "Web API markdown fallback auth failed for doc %s: %s",
+                        slug,
+                        exc.response.status_code,
+                    )
+                else:
+                    logger.debug(
+                        "Web API markdown fallback HTTP %s for doc %s",
+                        exc.response.status_code,
+                        slug,
+                    )
+            except Exception as exc:
+                logger.debug(
+                    "Web API markdown fallback failed for doc %s: %s",
+                    slug,
+                    exc,
+                )
+        return None
