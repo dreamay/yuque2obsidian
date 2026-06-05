@@ -103,8 +103,7 @@ obsidian_vault/
 yuque:
   token: "必填"                      # 语雀 API Token
   base_url: "https://www.yuque.com/api/v2"
-  # 浏览器 Cookie（可选，用于非官方 API 获取更干净的 Markdown）
-  # 普通导出不需要；仅当 debug 日志提示 auth failed 时才需配置
+  # 浏览器 Cookie（不用填，仅测试）
   # 获取方式：浏览器登录语雀 → F12 → Network → 复制 Cookie 头的值
   cookie: ""
 
@@ -138,7 +137,6 @@ ui:
 | 表格 | `lakesheet` | 解压 body 中的 zlib 数据 → 解析 JSON → Markdown 表格 |
 | 数据表 | `laketable` | 解析列定义 → 输出表头结构 |
 | 画板/思维导图 | `lakeboard` | 提取文本节点为列表 + 原文链接 |
-| 普通 Lake 文档 | `lake` | 优先用非官方 API 服务端转 Markdown；fallback: markdownify |
 
 ## 技术栈
 
