@@ -62,10 +62,6 @@ class Config(BaseModel):
         return Path(self.export.output_dir).expanduser().resolve()
 
     @property
-    def assets_path(self) -> Path:
-        return self.output_path / self.export.assets_dir
-
-    @property
     def db_path(self) -> Path:
         return self.output_path / ".yuque2obsidian.db"
 

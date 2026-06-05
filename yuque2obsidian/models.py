@@ -76,6 +76,13 @@ class TocNode(BaseModel):
     child_uuid: Optional[str] = None
     sibling_uuid: Optional[str] = None
 
+    @field_validator("doc_id", mode="before")
+    @classmethod
+    def _coerce_doc_id(cls, v: Any) -> Optional[int]:
+        if v is None or v == "":
+            return None
+        return int(v)
+
     def effective_parent_id(self) -> Optional[str]:
         return self.parent_uuid or self.parent_id
 

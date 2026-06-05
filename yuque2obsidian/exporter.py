@@ -14,7 +14,7 @@ from yuque2obsidian.config import Config
 from yuque2obsidian.markdown_processor import ResourceDownloader, process_markdown
 from yuque2obsidian.models import DocDetail, DocSummary, Repo, SyncState
 from yuque2obsidian.storage import Storage
-from yuque2obsidian.toc import TocTree
+from yuque2obsidian.toc import TocTree, sanitize_filename
 from yuque2obsidian.utils import safe_write
 
 logger = logging.getLogger("yuque2obsidian")
@@ -33,11 +33,21 @@ class Exporter:
         )
         self.storage = Storage(config.db_path)
         self.downloader = ResourceDownloader(
-            assets_path=config.assets_path,
             concurrency=config.export.concurrency,
         )
         self.output_path = config.output_path
         self._repo_filter: Optional[str] = None
+        self._link_cache: dict[tuple[str, str], Optional[str]] = {}
+
+    def _resolve_doc_link(self, namespace: str, slug: str) -> Optional[str]:
+        """Cross-repo link resolver backed by SQLite state cache."""
+        key = (namespace, slug)
+        if key in self._link_cache:
+            return self._link_cache[key]
+        state = self.storage.get_doc_state(namespace, slug)
+        path = state.file_path if state else None
+        self._link_cache[key] = path
+        return path
 
     async def close(self) -> None:
         await self.api.close()
@@ -139,6 +149,16 @@ class Exporter:
             "Repo '%s': %d docs, %d TOC nodes", repo.name, len(doc_summaries), len(toc_nodes)
         )
 
+        # Build slug -> local file path mapping for intra-repo link rewriting.
+        slug_to_path: dict[str, str] = {}
+        for summary in doc_summaries:
+            path = toc_tree.doc_file_path(
+                summary.id, summary.title or summary.slug, repo.name
+            )
+            if path is None:
+                path = Path(toc_tree.repo_name) / f"{summary.slug}.md"
+            slug_to_path[summary.slug] = str(path.as_posix())
+
         # Determine docs to sync.
         docs_to_sync: list[DocSummary] = []
         for summary in doc_summaries:
@@ -166,7 +186,7 @@ class Exporter:
         async def process_one(summary: DocSummary) -> None:
             async with semaphore:
                 try:
-                    await self._process_doc(summary, repo, toc_tree)
+                    await self._process_doc(summary, repo, toc_tree, slug_to_path)
                 except Exception as exc:
                     msg = f"Failed to process doc {repo.namespace}/{summary.slug}: {exc}"
                     logger.exception(msg)
@@ -177,7 +197,11 @@ class Exporter:
         return docs_total, docs_updated, docs_skipped, errors
 
     async def _process_doc(
-        self, summary: DocSummary, repo: Repo, toc_tree: TocTree
+        self,
+        summary: DocSummary,
+        repo: Repo,
+        toc_tree: TocTree,
+        slug_to_path: dict[str, str],
     ) -> None:
         detail = await self.api.get_doc_detail(repo.namespace, summary.slug)
 
@@ -191,13 +215,18 @@ class Exporter:
 
         doc_file = self.output_path / rel_path
 
-        # Process markdown: download resources, rewrite links, add frontmatter.
+        # Process markdown: rewrite internal links, download resources, add frontmatter.
+        repo_dir_name = sanitize_filename(repo.name)
+        repo_assets_path = self.output_path / repo_dir_name / self.config.export.assets_dir
         final_md = await process_markdown(
             detail,
             doc_file,
             repo.namespace,
             self.downloader,
             self.config,
+            repo_assets_path,
+            slug_to_path,
+            self._resolve_doc_link,
         )
 
         safe_write(doc_file, final_md)
