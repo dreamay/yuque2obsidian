@@ -3,15 +3,24 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import json
 import logging
+import re
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
 from yuque2obsidian.api import YuqueAPI
 from yuque2obsidian.config import Config
-from yuque2obsidian.markdown_processor import ResourceDownloader, process_markdown
+from yuque2obsidian.markdown_processor import (
+    ResourceDownloader,
+    build_frontmatter,
+    process_markdown,
+    relative_asset_path,
+)
+from yuque2obsidian.markdown_processor import _markdownify_html as markdownify_html
+from yuque2obsidian.markdown_processor import _looks_like_garbage as looks_like_garbage
 from yuque2obsidian.models import DocDetail, DocSummary, Repo, SyncState
 from yuque2obsidian.storage import Storage
 from yuque2obsidian.toc import TocTree, sanitize_filename
@@ -236,19 +245,27 @@ class Exporter:
 
         doc_file = self.output_path / rel_path
 
-        # Process markdown: rewrite internal links, download resources, add frontmatter.
-        repo_dir_name = sanitize_filename(repo.name)
-        repo_assets_path = self.output_path / repo_dir_name / self.config.export.assets_dir
-        final_md = await process_markdown(
-            detail,
-            doc_file,
-            repo.namespace,
-            self.downloader,
-            self.config,
-            repo_assets_path,
-            slug_to_path,
-            self._resolve_doc_link,
-        )
+        # Assets go into the same directory as the doc, not the repo root.
+        assets_path = doc_file.parent / self.config.export.assets_dir
+
+        # Handle special document types (board / table / sheet).
+        fmt = (detail.format or "").lower()
+        if fmt == "board":
+            final_md = await self._process_board_doc(detail, doc_file, assets_path, repo.namespace)
+        elif fmt in ("table", "sheet"):
+            final_md = await self._process_table_doc(detail, doc_file, assets_path, repo.namespace)
+        else:
+            # Standard markdown processing for lake / markdown docs.
+            final_md = await process_markdown(
+                detail,
+                doc_file,
+                repo.namespace,
+                self.downloader,
+                self.config,
+                assets_path,
+                slug_to_path,
+                self._resolve_doc_link,
+            )
 
         safe_write(doc_file, final_md)
         logger.debug("Wrote %s", doc_file)
@@ -262,4 +279,88 @@ class Exporter:
                 last_synced_at=datetime.now(),
                 file_path=str(rel_path.as_posix()),
             )
+        )
+
+    async def _process_board_doc(
+        self,
+        doc: DocDetail,
+        doc_file: Path,
+        assets_path: Path,
+        namespace: str,
+    ) -> str:
+        """Export a board (画板) document.
+
+        Yuque renders boards as HTML.  We first try to find a rendered image
+        inside *body_html*; if found we download it and reference it in the
+        Markdown.  Otherwise we save *body_html* as a companion `.html` file.
+        """
+        frontmatter = build_frontmatter(doc, namespace, self.config)
+        body_html = doc.body_html or ""
+        source_url = f"https://www.yuque.com{namespace}/docs/{doc.slug}"
+
+        # 1. Try to extract a rendered image.
+        img_match = re.search(
+            r'<img\s+[^>]*src=["\']([^"\']+)["\'][^>]*>',
+            body_html,
+            re.IGNORECASE,
+        )
+        if img_match:
+            img_url = img_match.group(1)
+            asset_path = await self.downloader.download(img_url, assets_path)
+            if asset_path is not None:
+                rel = relative_asset_path(doc_file, asset_path)
+                return f"{frontmatter}![{doc.title or '画板'}]({rel})\n\n"
+
+        # 2. No image – save body_html as HTML file.
+        html_file = doc_file.with_suffix(".html")
+        html_content = (
+            '<!DOCTYPE html>\n<html>\n<head>\n'
+            f'<meta charset="utf-8">\n'
+            f'<title>{html.escape(doc.title or "")}</title>\n'
+            '</head>\n<body>\n'
+            f'{body_html}\n'
+            '</body>\n</html>'
+        )
+        safe_write(html_file, html_content)
+        return (
+            f"{frontmatter}> 🎨 画板已导出为 HTML：[{html_file.name}]({html_file.name})\n\n"
+            f"> 或查看原文：[原文]({source_url})\n\n"
+        )
+
+    async def _process_table_doc(
+        self,
+        doc: DocDetail,
+        doc_file: Path,
+        assets_path: Path,
+        namespace: str,
+    ) -> str:
+        """Export a table / sheet (表格 / 数据表) document.
+
+        We try markdownify on *body_html* first.  If the result is clean we
+        return it; otherwise we fall back to saving the raw HTML as a companion
+        `.html` file so nothing is lost.
+        """
+        frontmatter = build_frontmatter(doc, namespace, self.config)
+        body_html = doc.body_html or ""
+        source_url = f"https://www.yuque.com{namespace}/docs/{doc.slug}"
+
+        if body_html:
+            md = markdownify_html(body_html)
+            if not looks_like_garbage(md):
+                return frontmatter + md + "\n\n"
+
+        # Fallback: save raw HTML.
+        html_file = doc_file.with_suffix(".html")
+        html_content = (
+            '<!DOCTYPE html>\n<html>\n<head>\n'
+            f'<meta charset="utf-8">\n'
+            f'<title>{html.escape(doc.title or "")}</title>\n'
+            '</head>\n<body>\n'
+            f'{body_html}\n'
+            '</body>\n</html>'
+        )
+        safe_write(html_file, html_content)
+        return (
+            f"{frontmatter}> 📊 表格已导出为 HTML：[{html_file.name}]({html_file.name})\n\n"
+            f"> 或查看原文：[原文]({source_url})\n\n"
         )
