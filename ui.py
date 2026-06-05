@@ -9,19 +9,29 @@ from pathlib import Path
 
 import gradio as gr
 
-from yuque2obsidian.config import Config, load_config
+from yuque2obsidian.config import Config, ExportConfig, FrontmatterConfig, UiConfig, YuqueConfig, load_config
 from yuque2obsidian.exporter import Exporter
 from yuque2obsidian.logger import GradioLogHandler, setup_logging
 
 logger = logging.getLogger("yuque2obsidian")
 
 
-def _load_config_safely(path: str) -> Config:
-    return load_config(Path(path))
+def _build_config(token: str, output_dir: str, config_path: str) -> Config:
+    """Build config from UI inputs or fallback to config file."""
+    # If token is provided, build config dynamically.
+    if token.strip():
+        return Config(
+            yuque=YuqueConfig(token=token.strip()),
+            export=ExportConfig(output_dir=output_dir.strip() or "./obsidian_vault"),
+            frontmatter=FrontmatterConfig(),
+            ui=UiConfig(),
+        )
+    # Otherwise fallback to config file.
+    return load_config(Path(config_path))
 
 
-async def _sync(config_path: str, full_sync: bool, repo_filter: str) -> str:
-    cfg = _load_config_safely(config_path)
+async def _sync(token: str, output_dir: str, config_path: str, full_sync: bool, repo_filter: str) -> str:
+    cfg = _build_config(token, output_dir, config_path)
     if full_sync:
         cfg.export.full_sync = True
 
@@ -46,12 +56,25 @@ def create_ui() -> gr.Blocks:
     with gr.Blocks(title="yuque2obsidian") as demo:
         gr.Markdown("# 语雀 → Obsidian 迁移工具")
         gr.Markdown(
-            "填写配置文件路径（参考 config.example.yaml），点击同步即可将语雀知识库导出为 Obsidian Markdown。"
+            "直接在下方填写 Token 和导出目录即可开始同步。"
+            "也可以留空 Token，从配置文件加载（参考 config.example.yaml）。"
         )
 
         with gr.Row():
+            token = gr.Textbox(
+                label="语雀 Token",
+                placeholder="从 https://www.yuque.com/settings/tokens 创建",
+                type="password",
+            )
+            output_dir = gr.Textbox(
+                label="导出目录",
+                value="./obsidian_vault",
+                placeholder="./obsidian_vault",
+            )
+
+        with gr.Row():
             config_path = gr.Textbox(
-                label="配置文件路径",
+                label="配置文件路径（可选，Token 留空时使用）",
                 value="config.yaml",
                 placeholder="config.yaml",
             )
@@ -70,13 +93,13 @@ def create_ui() -> gr.Blocks:
             autoscroll=True,
         )
 
-        async def on_click(config_path: str, full_sync: bool, repo_filter: str) -> tuple[str, str]:
-            result = await _sync(config_path, full_sync, repo_filter)
+        async def on_click(token: str, output_dir: str, config_path: str, full_sync: bool, repo_filter: str) -> tuple[str, str]:
+            result = await _sync(token, output_dir, config_path, full_sync, repo_filter)
             return result, gradio_handler.get_text()
 
         sync_btn.click(
             fn=on_click,
-            inputs=[config_path, full_sync, repo_filter],
+            inputs=[token, output_dir, config_path, full_sync, repo_filter],
             outputs=[status, logs],
         )
 
