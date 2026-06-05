@@ -37,23 +37,30 @@ pip install -r requirements.txt
 
 如果已安装，pip 会快速跳过。
 
-### Step 3: 创建配置文件
+### Step 3: 获取 Token 和导出目录
 
-检查 `$PROJECT_DIR/config.yaml` 是否存在：
+**最高优先级：用户直接提供的值**
+- 如果用户在 UI/对话中直接提供了 **Token** 和 **导出目录**，直接使用这些值，跳过 config.yaml 检查。
+- 如果用户只提供了 Token，导出目录默认使用 `./obsidian_vault`。
 
-- **如果不存在**：从模板复制，并**询问用户**语雀 Token
-  ```bash
-  cp "$PROJECT_DIR/config.example.yaml" "$PROJECT_DIR/config.yaml"
-  ```
-  然后引导用户去 https://www.yuque.com/settings/tokens 创建 Token，填入 `config.yaml` 的 `yuque.token` 字段。
+**回退：从 config.yaml 读取**
+- 检查 `$PROJECT_DIR/config.yaml` 是否存在：
+  - 如果不存在：从模板复制
+    ```bash
+    cp "$PROJECT_DIR/config.example.yaml" "$PROJECT_DIR/config.yaml"
+    ```
+  - 如果存在但 token 为空/占位符：需要用户提供真实 Token
 
-- **如果存在但 token 为空/占位符**：提醒用户填入真实 Token
-
-- **如果存在且 token 有效**：继续下一步
+**强制要求：Token 必须提供**
+- 如果到这一步仍然没有有效的 Token（用户没直接提供，config.yaml 也没有），**必须主动询问用户**：
+  > "请提供语雀 Token（从 https://www.yuque.com/settings/tokens 创建，需有读取知识库权限），或编辑 `$PROJECT_DIR/config.yaml` 填入 `yuque.token`。"
+- 在用户提供有效 Token 之前，**不要继续执行导出**。
 
 ### Step 4: 确认输出目录
 
-默认输出到 `$PROJECT_DIR/obsidian_vault/`。如果用户想改，修改 `config.yaml` 中的 `export.output_dir`。
+- 如果用户直接提供了导出目录，使用用户指定的路径。
+- 否则使用 `config.yaml` 中的 `export.output_dir`（默认 `./obsidian_vault`）。
+- 如果输出目录不存在，工具会自动创建。
 
 ---
 
@@ -65,6 +72,8 @@ pip install -r requirements.txt
 cd "$PROJECT_DIR"
 python main.py --config config.yaml [options]
 ```
+
+如果用户直接提供了 Token 和导出目录，可以动态构建配置执行，无需依赖 config.yaml。
 
 不要尝试用 Web UI（`ui.py`）完成批量导出任务，CLI 更适合自动化和日志追踪。
 
@@ -166,18 +175,26 @@ obsidian_vault/
 
 ### 1. 用户说"导出语雀笔记" / "同步语雀到 Obsidian"
 
-1. 执行 **Auto-Setup**（检测项目 → clone → 装依赖 → 确认配置）
-2. 询问是否是首次导出（决定是否加 `--full-sync`）
-3. 执行 `python main.py --config config.yaml [--full-sync]`
+1. 执行 **Auto-Setup**（检测项目 → clone → 装依赖 → **获取 Token 和导出目录**）
+2. **自动判断首次还是后续**：
+   - 检查 `{output_dir}/.yuque2obsidian.db` 是否存在且 `docs` 表中有记录
+   - **如果是首次（无记录）** → 自动使用 `--full-sync` 全量导出
+   - **如果是后续（有记录）** → 使用增量同步，不附加 `--full-sync`
+   - **如果用户明确说"重新全量导出"** → 使用 `--full-sync`
+3. 执行导出命令
 4. 观察输出日志，汇总结果（成功/失败/跳过的文档数）
 
-### 2. 用户说"导出某个知识库"
+### 2. 用户说"导出某个知识库" / "只导出 XX 知识库"
 
 1. 执行 **Auto-Setup**
-2. 执行 `python main.py --config config.yaml --repo "知识库名称" [--full-sync]`
-3. 如果知识库名不确定，先执行一次无 `--repo` 的导出，从日志中列出所有知识库名称
+2. 自动判断首次/后续（同上：检查 SQLite 是否有记录）
+3. 执行：
+   ```bash
+   python main.py --config config.yaml --repo "知识库名称" [--full-sync]
+   ```
+4. 如果知识库名不确定，先执行一次无 `--repo` 的导出，从日志中列出所有知识库名称供用户选择
 
-### 3. 用户说"重新全量导出"
+### 3. 用户说"重新全量导出" / "强制全量同步"
 
 1. 执行 **Auto-Setup**
 2. 提醒 `--full-sync` 会重新下载所有文档，覆盖本地文件
