@@ -49,6 +49,7 @@ class YuqueAPI:
         concurrency: int = 5,
         rate_limit: float = 1.3,
         timeout: float = 60.0,
+        cookie: str = "",
     ) -> None:
         self.token = token
         self.base_url = base_url.rstrip("/")
@@ -61,11 +62,39 @@ class YuqueAPI:
             timeout=httpx.Timeout(timeout),
             follow_redirects=True,
         )
+        # Separate client for unofficial API using cookie auth.
+        self._cookie = cookie
+        web_headers: dict[str, str] = {
+            "Content-Type": "application/json",
+            "Referer": "https://www.yuque.com",
+            "User-Agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
+            ),
+        }
+        if cookie:
+            # Support both full cookie string and bare session value.
+            if "=" in cookie:
+                web_headers["Cookie"] = cookie
+            else:
+                web_headers["Cookie"] = f"_yuque_session={cookie}"
+        else:
+            # Fallback: try using the API token as cookie (works for some accounts).
+            web_headers["Cookie"] = f"_yuque_session={token}"
+        # Also send the token header as some endpoints accept either.
+        web_headers["X-Auth-Token"] = token
+        self._web_client = httpx.AsyncClient(
+            headers=web_headers,
+            timeout=httpx.Timeout(timeout),
+            follow_redirects=True,
+        )
         self.semaphore = asyncio.Semaphore(concurrency)
         self.rate_limiter = RateLimiter(rate_limit)
 
     async def close(self) -> None:
         await self.client.aclose()
+        await self._web_client.aclose()
 
     async def _request(
         self,
@@ -188,8 +217,55 @@ class YuqueAPI:
         return DocDetail.model_validate(data)
 
     # ------------------------------------------------------------------
-    # Unofficial web API fallback (for Lake → Markdown server conversion)
+    # Unofficial web API (raw content / Markdown conversion)
     # ------------------------------------------------------------------
+
+    async def get_doc_raw_content(
+        self, slug: str, book_id: int
+    ) -> Optional[dict[str, Any]]:
+        """Fetch raw document data from the unofficial web API (no Markdown conversion).
+
+        Returns the ``data`` dict from the response which may contain:
+        - ``type``: document type (e.g. "sheet", "board", "Doc")
+        - ``content``: raw content string (for sheet docs, this is JSON with
+          a compressed ``sheet`` field)
+        - ``sourcecode``: original lake/markdown source
+
+        Returns *None* on any failure so callers can fall back gracefully.
+        """
+        url = f"https://www.yuque.com/api/docs/{slug}"
+        params = {
+            "book_id": str(book_id),
+            "merge_dynamic_data": "false",
+        }
+        async with self.semaphore:
+            await self.rate_limiter.acquire()
+            try:
+                response = await self._web_client.get(url, params=params)
+                response.raise_for_status()
+                payload = response.json()
+                data = payload.get("data")
+                if isinstance(data, dict):
+                    logger.debug(
+                        "Raw content fetch succeeded for doc %s (book_id=%s, type=%s)",
+                        slug,
+                        book_id,
+                        data.get("type"),
+                    )
+                    return data
+            except httpx.HTTPStatusError as exc:
+                logger.debug(
+                    "Raw content fetch HTTP %s for doc %s",
+                    exc.response.status_code,
+                    slug,
+                )
+            except Exception as exc:
+                logger.debug(
+                    "Raw content fetch failed for doc %s: %s",
+                    slug,
+                    exc,
+                )
+        return None
 
     async def get_doc_markdown_via_web_api(
         self, slug: str, book_id: int
@@ -201,10 +277,7 @@ class YuqueAPI:
         on the server side.  This often produces cleaner output than local
         HTML→Markdown conversion.
 
-        Authentication: this endpoint historically requires a web session
-        (cookie).  The Token used for API v2 may or may not work here, so we
-        try gracefully and return *None* on any failure so the caller can
-        fall back to the official ``body`` / ``body_html`` fields.
+        Uses cookie-based authentication via _web_client.
         """
         url = f"https://www.yuque.com/api/docs/{slug}"
         params = {
@@ -215,7 +288,7 @@ class YuqueAPI:
         async with self.semaphore:
             await self.rate_limiter.acquire()
             try:
-                response = await self.client.get(url, params=params)
+                response = await self._web_client.get(url, params=params)
                 response.raise_for_status()
                 payload = response.json()
                 data = payload.get("data", {})
@@ -229,22 +302,22 @@ class YuqueAPI:
                     )
                     return source
             except httpx.HTTPStatusError as exc:
-                # 401/403 means the Token doesn't work for the web API.
                 if exc.response.status_code in (401, 403):
                     logger.debug(
-                        "Web API markdown fallback auth failed for doc %s: %s",
+                        "Web API markdown auth failed for doc %s: %s "
+                        "(set yuque.cookie in config.yaml)",
                         slug,
                         exc.response.status_code,
                     )
                 else:
                     logger.debug(
-                        "Web API markdown fallback HTTP %s for doc %s",
+                        "Web API markdown HTTP %s for doc %s",
                         exc.response.status_code,
                         slug,
                     )
             except Exception as exc:
                 logger.debug(
-                    "Web API markdown fallback failed for doc %s: %s",
+                    "Web API markdown failed for doc %s: %s",
                     slug,
                     exc,
                 )

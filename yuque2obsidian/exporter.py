@@ -16,6 +16,7 @@ from yuque2obsidian.config import Config
 from yuque2obsidian.markdown_processor import (
     ResourceDownloader,
     build_frontmatter,
+    parse_sheet_from_raw_content,
     process_markdown,
     relative_asset_path,
 )
@@ -29,6 +30,60 @@ from yuque2obsidian.utils import safe_write
 logger = logging.getLogger("yuque2obsidian")
 
 
+def _extract_board_text(body: str) -> Optional[str]:
+    """Try to extract readable text from a lakeboard body JSON.
+
+    For mindmaps, we can build a hierarchical text representation.
+    For other board types, we extract any text nodes we find.
+    """
+    if not body:
+        return None
+    try:
+        data = json.loads(body)
+    except (json.JSONDecodeError, TypeError):
+        return None
+
+    fmt = (data.get("format") or "").lower()
+    if fmt != "lakeboard":
+        return None
+
+    diagram = data.get("diagramData", {})
+    body_nodes = diagram.get("body", [])
+    if not body_nodes:
+        return None
+
+    lines: list[str] = []
+    for node in body_nodes:
+        node_type = (node.get("type") or "").lower()
+        if node_type == "mindmap":
+            # Extract mindmap as a hierarchical list.
+            _extract_mindmap_node(node, lines, depth=0)
+        else:
+            # Extract any html text from the node.
+            html_text = node.get("html", "")
+            if html_text:
+                clean = re.sub(r'<[^>]+>', '', html_text).strip()
+                clean = clean.replace("​", "")  # Remove zero-width spaces.
+                if clean:
+                    lines.append(f"- {clean}")
+
+    return "\n".join(lines) if lines else None
+
+
+def _extract_mindmap_node(node: dict, lines: list[str], depth: int) -> None:
+    """Recursively extract mindmap nodes into an indented list."""
+    html_text = node.get("html", "")
+    clean = re.sub(r'<[^>]+>', '', html_text).strip()
+    clean = clean.replace("​", "")  # Remove zero-width spaces.
+    clean = clean.replace("&#8203;", "")  # Also HTML entity form.
+    clean = html.unescape(clean).strip()  # Decode remaining HTML entities.
+    if clean:
+        indent = "  " * depth
+        lines.append(f"{indent}- {clean}")
+    for child in node.get("children", []):
+        _extract_mindmap_node(child, lines, depth + 1)
+
+
 class Exporter:
     """Export Yuque docs to Obsidian-compatible Markdown files."""
 
@@ -39,6 +94,7 @@ class Exporter:
             base_url=config.yuque.base_url,
             concurrency=config.export.concurrency,
             rate_limit=config.export.rate_limit,
+            cookie=config.yuque.cookie,
         )
         self.storage = Storage(config.db_path)
         self.downloader = ResourceDownloader(
@@ -222,18 +278,54 @@ class Exporter:
     ) -> None:
         detail = await self.api.get_doc_detail(repo.namespace, summary.slug)
 
-        # For Lake-format docs, try the unofficial web API first – it returns
-        # server-converted Markdown which is usually much cleaner than local
-        # HTML→Markdown conversion.
-        if detail.format and detail.format.lower() == "lake" and detail.book_id:
-            web_md = await self.api.get_doc_markdown_via_web_api(
-                detail.slug, detail.book_id
-            )
-            if web_md is not None:
-                detail.body = web_md
+        # Determine the *actual* document content type via the unofficial API.
+        # The official API often returns format="lake" for all doc types
+        # (sheet, board, table, doc), so we can't rely on it for routing.
+        actual_type: Optional[str] = None
+        raw_data: Optional[dict] = None
+
+        if detail.book_id:
+            raw_data = await self.api.get_doc_raw_content(detail.slug, detail.book_id)
+            if raw_data:
+                actual_type = (raw_data.get("type") or "").lower()
                 logger.debug(
-                    "Using web API markdown for lake doc %s/%s", repo.namespace, detail.slug
+                    "Raw API type for %s/%s: %s (official format: %s)",
+                    repo.namespace,
+                    detail.slug,
+                    actual_type,
+                    detail.format,
                 )
+
+        # For regular lake/markdown docs, try the mode=markdown endpoint for
+        # cleaner server-side conversion. Skip for sheet/board/table types.
+        fmt_lower = (detail.format or "").lower()
+        is_special_format = fmt_lower in (
+            "lakesheet", "laketable", "lakeboard",
+            "sheet", "table", "board",
+        )
+        if actual_type not in ("sheet", "board", "table") and not is_special_format:
+            if fmt_lower == "lake" and detail.book_id:
+                # Use sourcecode from raw_data if available, otherwise fetch via
+                # the mode=markdown endpoint.
+                sourcecode = raw_data.get("sourcecode") if raw_data else None
+                if isinstance(sourcecode, str) and sourcecode.strip():
+                    detail.body = sourcecode
+                    logger.debug(
+                        "Using raw API sourcecode for lake doc %s/%s",
+                        repo.namespace,
+                        detail.slug,
+                    )
+                else:
+                    web_md = await self.api.get_doc_markdown_via_web_api(
+                        detail.slug, detail.book_id
+                    )
+                    if web_md is not None:
+                        detail.body = web_md
+                        logger.debug(
+                            "Using web API markdown for lake doc %s/%s",
+                            repo.namespace,
+                            detail.slug,
+                        )
 
         rel_path = toc_tree.doc_file_path(
             detail.id,
@@ -248,24 +340,38 @@ class Exporter:
         # Assets go into the same directory as the doc, not the repo root.
         assets_path = doc_file.parent / self.config.export.assets_dir
 
-        # Handle special document types (board / table / sheet).
-        fmt = (detail.format or "").lower()
-        if fmt == "board":
-            final_md = await self._process_board_doc(detail, doc_file, assets_path, repo.namespace)
-        elif fmt in ("table", "sheet"):
-            final_md = await self._process_table_doc(detail, doc_file, assets_path, repo.namespace)
-        else:
-            # Standard markdown processing for lake / markdown docs.
-            final_md = await process_markdown(
-                detail,
-                doc_file,
-                repo.namespace,
-                self.downloader,
-                self.config,
-                assets_path,
-                slug_to_path,
-                self._resolve_doc_link,
+        # Route to the correct handler based on actual content type.
+        # The unofficial API returns type like "sheet"/"board"/"Doc",
+        # while the official API format is "lakesheet"/"lakeboard"/"laketable"/"lake".
+        is_board = (
+            actual_type == "board"
+            or (detail.format or "").lower() in ("board", "lakeboard")
+        )
+        is_table = (
+            actual_type in ("table", "sheet")
+            or (detail.format or "").lower() in ("table", "sheet", "laketable", "lakesheet")
+        )
+
+        if is_board:
+            final_md = await self._process_board_doc(
+                detail, doc_file, assets_path, repo.namespace, raw_data
             )
+        elif is_table:
+            final_md = await self._process_table_doc(
+                detail, doc_file, assets_path, repo.namespace, raw_data
+            )
+        else:
+                # Standard markdown processing for lake / markdown docs.
+                final_md = await process_markdown(
+                    detail,
+                    doc_file,
+                    repo.namespace,
+                    self.downloader,
+                    self.config,
+                    assets_path,
+                    slug_to_path,
+                    self._resolve_doc_link,
+                )
 
         safe_write(doc_file, final_md)
         logger.debug("Wrote %s", doc_file)
@@ -287,18 +393,39 @@ class Exporter:
         doc_file: Path,
         assets_path: Path,
         namespace: str,
+        raw_data: Optional[dict] = None,
     ) -> str:
         """Export a board (画板) document.
 
-        Yuque renders boards as HTML.  We first try to find a rendered image
-        inside *body_html*; if found we download it and reference it in the
-        Markdown.  Otherwise we save *body_html* as a companion `.html` file.
+        Boards are canvas/SVG data. Strategy:
+        1. Try to extract a cover/preview image from raw API or body_html.
+        2. Try to extract text content from the board body JSON (mindmap nodes, etc).
+        3. Fall back to a placeholder with a link to the original.
         """
         frontmatter = build_frontmatter(doc, namespace, self.config)
         body_html = doc.body_html or ""
-        source_url = f"https://www.yuque.com{namespace}/docs/{doc.slug}"
+        source_url = f"https://www.yuque.com/{namespace}/docs/{doc.slug}"
 
-        # 1. Try to extract a rendered image.
+        # 1. Try raw API for cover/preview image.
+        if raw_data is None and doc.book_id:
+            raw_data = await self.api.get_doc_raw_content(doc.slug, doc.book_id)
+
+        if raw_data:
+            img_url = (
+                raw_data.get("cover")
+                or raw_data.get("preview")
+                or raw_data.get("card_url")
+            )
+            if img_url:
+                asset_path = await self.downloader.download(img_url, assets_path)
+                if asset_path is not None:
+                    rel = relative_asset_path(doc_file, asset_path)
+                    return (
+                        f"{frontmatter}![{doc.title or '画板'}]({rel})\n\n"
+                        f"> 查看原文：[原文]({source_url})\n\n"
+                    )
+
+        # 2. Try to extract an <img> from body_html.
         img_match = re.search(
             r'<img\s+[^>]*src=["\']([^"\']+)["\'][^>]*>',
             body_html,
@@ -309,22 +436,22 @@ class Exporter:
             asset_path = await self.downloader.download(img_url, assets_path)
             if asset_path is not None:
                 rel = relative_asset_path(doc_file, asset_path)
-                return f"{frontmatter}![{doc.title or '画板'}]({rel})\n\n"
+                return (
+                    f"{frontmatter}![{doc.title or '画板'}]({rel})\n\n"
+                    f"> 查看原文：[原文]({source_url})\n\n"
+                )
 
-        # 2. No image – save body_html as HTML file.
-        html_file = doc_file.with_suffix(".html")
-        html_content = (
-            '<!DOCTYPE html>\n<html>\n<head>\n'
-            f'<meta charset="utf-8">\n'
-            f'<title>{html.escape(doc.title or "")}</title>\n'
-            '</head>\n<body>\n'
-            f'{body_html}\n'
-            '</body>\n</html>'
-        )
-        safe_write(html_file, html_content)
+        # 3. Try to extract text from board body JSON (mindmap, diagrams).
+        board_text = _extract_board_text(doc.body)
+        if board_text:
+            return (
+                f"{frontmatter}{board_text}\n\n"
+                f"> 查看原文：[原文]({source_url})\n\n"
+            )
+
+        # 4. Placeholder with link.
         return (
-            f"{frontmatter}> 🎨 画板已导出为 HTML：[{html_file.name}]({html_file.name})\n\n"
-            f"> 或查看原文：[原文]({source_url})\n\n"
+            f"{frontmatter}> 🎨 画板内容无法直接导出，请查看原文：[原文]({source_url})\n\n"
         )
 
     async def _process_table_doc(
@@ -333,23 +460,51 @@ class Exporter:
         doc_file: Path,
         assets_path: Path,
         namespace: str,
+        raw_data: Optional[dict] = None,
     ) -> str:
         """Export a table / sheet (表格 / 数据表) document.
 
-        We try markdownify on *body_html* first.  If the result is clean we
-        return it; otherwise we fall back to saving the raw HTML as a companion
-        `.html` file so nothing is lost.
+        Strategy (in priority order):
+        1. Parse the doc.body directly — for lakesheet/laketable the body is
+           JSON containing a compressed 'sheet' field.
+        2. Try the raw API content field.
+        3. Use markdownify on body_html if it produces clean output.
+        4. Save body_html as a companion .html file as fallback.
         """
         frontmatter = build_frontmatter(doc, namespace, self.config)
         body_html = doc.body_html or ""
-        source_url = f"https://www.yuque.com{namespace}/docs/{doc.slug}"
+        source_url = f"https://www.yuque.com/{namespace}/docs/{doc.slug}"
 
+        # 1. Try to parse doc.body directly (it's JSON for lakesheet/laketable).
+        md = parse_sheet_from_raw_content(doc.body)
+        if md:
+            logger.debug(
+                "Sheet parsed from doc body for %s/%s", namespace, doc.slug
+            )
+            return frontmatter + md + "\n\n"
+
+        # 2. Try raw API content field.
+        if raw_data is None and doc.book_id:
+            raw_data = await self.api.get_doc_raw_content(doc.slug, doc.book_id)
+
+        if raw_data:
+            content_str = raw_data.get("content")
+            md = parse_sheet_from_raw_content(content_str)
+            if md:
+                logger.debug(
+                    "Sheet parsed from raw API content for %s/%s",
+                    namespace,
+                    doc.slug,
+                )
+                return frontmatter + md + "\n\n"
+
+        # 3. Try markdownify on body_html.
         if body_html:
             md = markdownify_html(body_html)
             if not looks_like_garbage(md):
                 return frontmatter + md + "\n\n"
 
-        # Fallback: save raw HTML.
+        # 4. Fallback: save raw HTML.
         html_file = doc_file.with_suffix(".html")
         html_content = (
             '<!DOCTYPE html>\n<html>\n<head>\n'

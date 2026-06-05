@@ -12,6 +12,9 @@ from pydantic import BaseModel, Field, ValidationError, field_validator
 class YuqueConfig(BaseModel):
     token: str
     base_url: str = "https://www.yuque.com/api/v2"
+    # Browser cookie for unofficial API endpoints (sheet/board export).
+    # Get it from browser DevTools: _yuque_session=xxx or full cookie string.
+    cookie: str = ""
 
 
 class ExportConfig(BaseModel):

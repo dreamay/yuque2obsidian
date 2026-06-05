@@ -1,8 +1,13 @@
-# 复制本文件为 config.yaml 并填入你的 Token
+# 复制本文件为 config.yaml 并填入你的 Token，只需要填写 Token 即可
 
 yuque:
   token: "your-yuque-token-here"    # 必填，从 https://www.yuque.com/settings/tokens 创建
   base_url: "https://www.yuque.com/api/v2"
+  # 浏览器 Cookie（用于表格/画板等非官方 API 导出）
+  # 获取方式：浏览器登录语雀 → F12 → Network → 复制请求头中的 Cookie 值
+  # 可以是完整 cookie 字符串，也可以只填 _yuque_session 的值
+  # 不需要填写，暂时只为测试新功能用
+  cookie: ""
 
 export:
   output_dir: "./obsidian_vault"    # Obsidian 库输出目录

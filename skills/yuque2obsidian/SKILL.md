@@ -104,6 +104,9 @@ python main.py --config config.yaml
 # 只导出指定知识库
 python main.py --config config.yaml --repo "知识库名称"
 
+# 开启 debug 日志排查问题（显示 API 调用细节、类型检测、认证状态）
+python main.py --config config.yaml -v
+
 # 使用自定义配置文件路径
 python main.py --config /path/to/config.yaml
 ```
@@ -129,10 +132,11 @@ python main.py --config /path/to/config.yaml
 yuque:
   token: "your-yuque-token-here"      # 必填
   base_url: "https://www.yuque.com/api/v2"
+  cookie: ""                          # 可选，用于增强普通 lake 文档的 Markdown 转换
 
 export:
   output_dir: "./obsidian_vault"      # Obsidian 库输出目录
-  assets_dir: "assets"                # 资源文件夹名（放在各知识库内部）
+  assets_dir: "assets"                # 资源文件夹名（放在各文档目录内）
   include_personal: true              # 导出个人知识库
   include_groups: true                # 导出团队/协作知识库
   incremental: true                   # 启用增量同步
@@ -203,11 +207,13 @@ obsidian_vault/
 ### 4. 用户遇到导出错误或文档缺失
 
 排查清单：
+- **开启 debug 日志**：使用 `-v` 参数，查看 API 调用细节和类型检测
 - **项目是否存在**：如不存在，执行 Auto-Setup Step 1 clone
 - **依赖是否安装**：执行 Auto-Setup Step 2
 - **Token 权限**：确认 Token 有读取对应知识库的权限
 - **配置范围**：检查 `include_personal` / `include_groups` 设置
 - **API 限流**：语雀限制约 5000 次/小时，工具已内置限流和重试
+- **认证问题**：debug 日志中如果看到 `auth failed`，配置 `yuque.cookie`
 - **错误日志**：查看具体报错的 repo 和 doc
 - **下载失败**：检查 `{output_dir}/failed_downloads.json`
 
@@ -235,11 +241,12 @@ sqlite3 obsidian_vault/.yuque2obsidian.db \
 | 全量同步 | `--full-sync` 强制重新下载所有文档 |
 | 指定知识库 | `--repo "名称"` 只导出匹配的知识库 |
 | TOC 层级映射 | 按语雀目录树生成文件夹；父文档有子节点时放入同名文件夹 |
-| 图片/附件下载 | 下载到各知识库 `assets/` 目录，去重（URL hash 命名） |
+| 图片/附件下载 | 下载到各文档目录 `assets/`，去重（URL hash 命名） |
 | 内部链接替换 | 语雀 `https://www.yuque.com/.../docs/xxx` → Obsidian `[[...]]` |
-| Lake 格式转换 | 画板/思维导图生成占位提示、HTML 表格→Markdown、HTML→Markdown fallback |
+| Lake 格式转换 | 表格 (lakesheet) → Markdown 表格；数据表 (laketable) → 列结构；画板 (lakeboard) → 思维导图文本 + 原文链接 |
 | Frontmatter | 自动生成 YAML frontmatter（title、created、updated、source、tags） |
 | 中文字符保留 | 文件名使用 `slugify(allow_unicode=True)`，保留中文 |
+| Debug 日志 | `-v` 参数显示 API 调用、类型检测、认证状态等详细信息 |
 
 ---
 
