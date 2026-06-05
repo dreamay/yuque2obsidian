@@ -320,12 +320,37 @@ def _markdownify_html(html_text: str) -> str:
     return md.strip()
 
 
-def _handle_lake_cards(text: str, namespace: str, slug: str) -> str:
-    """Replace lake board / mind-map cards with placeholders."""
+# Lakesheet-specific patterns
+LAKE_SHEET_RE = re.compile(r'<div[^>]*data-lake-card=["\'][^"\']*sheet[^"\']*["\'][^>]*>.*?</div>', re.DOTALL | re.IGNORECASE)
+LAKE_SHEET_IMG_RE = re.compile(
+    r'<div[^>]*data-lake-card=["\'][^"\']*sheet[^"\']*["\'][^>]*>.*?<img\s+[^>]*src=["\']([^"\']+)["\'][^>]*>.*?</div>',
+    re.DOTALL | re.IGNORECASE,
+)
 
+
+def _handle_lake_cards(text: str, namespace: str, slug: str) -> str:
+    """Replace lake board / mind-map / sheet cards with placeholders."""
+    source_url = f"https://www.yuque.com{namespace}/docs/{slug}"
+
+    # 1. Lakesheet – try to extract a rendered image first, otherwise placeholder.
+    def _sheet_repl(m: re.Match[str]) -> str:
+        # Try to find an <img> inside the lake-sheet card (Yuque sometimes
+        # renders the sheet as a static image).
+        img_match = re.search(
+            r'<img\s+[^>]*src=["\']([^"\']+)["\'][^>]*>',
+            m.group(0),
+            re.IGNORECASE,
+        )
+        if img_match:
+            img_url = img_match.group(1)
+            return f'> 📊 数据表（原文图片）：![sheet]({img_url})\n\n> 或查看原文：[原文]({source_url})\n\n'
+        return f'> 📊 数据表内容无法直接导出，请查看原文：[原文]({source_url})\n\n'
+
+    text = LAKE_SHEET_RE.sub(_sheet_repl, text)
+
+    # 2. Board / mind-map placeholders
     def _card_repl(m: re.Match[str]) -> str:
         card_html = m.group(0).lower()
-        source_url = f"https://www.yuque.com{namespace}/docs/{slug}"
         if 'board' in card_html or 'whiteboard' in card_html:
             return f'> 🎨 画板内容无法直接导出，请查看原文：[原文]({source_url})\n\n'
         if 'mindmap' in card_html or 'mind' in card_html:
@@ -337,36 +362,76 @@ def _handle_lake_cards(text: str, namespace: str, slug: str) -> str:
     return LAKE_CARD_RE.sub(_card_repl, text)
 
 
+def _looks_like_garbage(text: str) -> bool:
+    """Heuristic: does the converted text look garbled / unreadable?
+
+    We check for excessive HTML entities, stray tags, or very high ratio of
+    non-printable / markup characters.
+    """
+    if not text:
+        return True
+    # Lots of un-decoded HTML entities
+    if text.count('&') > 10 and re.search(r'&[a-zA-Z#0-9]+;', text):
+        return True
+    # Still contains raw <tags> after conversion
+    raw_tags = re.findall(r'<[^>]+>', text)
+    if len(raw_tags) > 5:
+        return True
+    return False
+
+
 def convert_lake_body(
     body: str,
     body_html: Optional[str],
     namespace: str,
     slug: str,
+    doc_format: Optional[str] = None,
 ) -> str:
     """Convert lake-format document body to Obsidian-compatible Markdown.
 
     Strategy:
-    1. Replace lake cards (board / mind-map) with placeholders first, before
-       any HTML→Markdown conversion, so the placeholders survive intact.
-    2. If the body is short or contains heavy HTML, convert *body_html* (or
-       the body itself) with markdownify for high-quality Markdown output.
-    3. Post-process HTML tables that markdownify may not handle perfectly.
-    4. Detect lakesheet (data-table) JSON payloads and convert them.
+    1. For standalone *sheet* documents (format="sheet") try markdownify on
+       body_html, but fall back to a placeholder if the output looks garbled.
+    2. For embedded lakesheets inside a Lake doc, extract any rendered image
+       or replace with a placeholder.
+    3. Replace lake cards (board / mind-map) with placeholders.
+    4. If the body is short or contains heavy HTML, convert with markdownify.
+    5. Post-process HTML tables.
     """
     if not body:
         body = ''
 
-    # Step 1: lakesheet JSON detection
-    # Yuque sometimes embeds sheet data as a JSON blob in the body.
+    source_url = f"https://www.yuque.com{namespace}/docs/{slug}"
+
+    # ------------------------------------------------------------------
+    # Standalone sheet-type document
+    # ------------------------------------------------------------------
+    if doc_format and doc_format.lower() == "sheet":
+        if body_html:
+            # If the HTML contains a lakesheet card, try to grab the image.
+            img_match = LAKE_SHEET_IMG_RE.search(body_html)
+            if img_match:
+                img_url = img_match.group(1)
+                return f"> 📊 数据表（原文图片）：![sheet]({img_url})\n\n> 或查看原文：[原文]({source_url})\n\n"
+            # Otherwise attempt markdownify, but guard against garbage.
+            md = _markdownify_html(body_html)
+            if not _looks_like_garbage(md):
+                return md
+        return f"> 📊 数据表内容无法直接导出，请查看原文：[原文]({source_url})\n\n"
+
+    # ------------------------------------------------------------------
+    # Normal Lake doc (may contain embedded lakesheets, boards, etc.)
+    # ------------------------------------------------------------------
+
+    # Step 1: lakesheet JSON detection (rare, but official API may include it).
     _sheet_json = _try_extract_lakesheet(body)
     if _sheet_json is not None:
         return _sheet_json
 
-    # Step 2: replace known lake cards with placeholders
+    # Step 2: replace known lake cards with placeholders.
     body = _handle_lake_cards(body, namespace, slug)
 
-    # Step 3: decide whether we need heavy HTML→Markdown conversion
-    # Heuristic: body is very short, or body contains significant HTML markup.
+    # Step 3: decide whether we need heavy HTML→Markdown conversion.
     body_stripped = body.strip()
     has_substantial_html = body.count('<') > 5 and '<div' in body.lower()
     needs_conversion = len(body_stripped) < 100 or has_substantial_html
@@ -377,7 +442,7 @@ def convert_lake_body(
         # Re-apply card placeholders (markdownify preserves blockquote text).
         body = _handle_lake_cards(body, namespace, slug)
 
-    # Step 4: fix up tables that markdownify may have left with quirks
+    # Step 4: fix up tables that markdownify may have left with quirks.
     body = _convert_html_tables(body)
 
     return body
@@ -511,7 +576,7 @@ async def process_markdown(
 
     # 1. Lake format conversion (画板 / 思维导图 / 表格等)
     if doc.format and doc.format.lower() == "lake":
-        body = convert_lake_body(body, doc.body_html, namespace, doc.slug)
+        body = convert_lake_body(body, doc.body_html, namespace, doc.slug, doc.format)
 
     # 2. Rewrite Yuque internal doc links → Obsidian [[...]] links
     body = rewrite_internal_links(body, namespace, slug_to_path, resolve_link)

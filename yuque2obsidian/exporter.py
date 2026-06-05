@@ -170,6 +170,14 @@ class Exporter:
                 docs_to_sync.append(summary)
             elif state.content_updated_at != summary.content_updated_at:
                 docs_to_sync.append(summary)
+            elif state.file_path and not (self.output_path / state.file_path).exists():
+                # File was manually deleted since last sync – re-export it.
+                logger.info(
+                    "Re-exporting %s/%s because local file was deleted",
+                    repo.namespace,
+                    summary.slug,
+                )
+                docs_to_sync.append(summary)
 
         docs_total = len(doc_summaries)
         docs_updated = len(docs_to_sync)
