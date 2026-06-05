@@ -3,16 +3,20 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import html
+import json
 import logging
 import os
 import re
 import urllib.parse
+import zlib
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 import httpx
+import markdownify
 
 from yuque2obsidian.config import Config
 from yuque2obsidian.models import DocDetail
@@ -304,46 +308,80 @@ def _convert_html_tables(text: str) -> str:
     return HTML_TABLE_RE.sub(_table_repl, text)
 
 
-def _basic_html_to_markdown(html_text: str) -> str:
-    """Lightweight HTML → Markdown converter for lake *body_html* fallback."""
-    text = html_text
-    # Strip script / style blocks completely.
-    text = re.sub(r'<script[^>]*>.*?</script>', '', text, flags=re.DOTALL | re.IGNORECASE)
-    text = re.sub(r'<style[^>]*>.*?</style>', '', text, flags=re.DOTALL | re.IGNORECASE)
-    # Headings
-    for i in range(6, 0, -1):
-        text = re.sub(rf'<h{i}[^>]*>(.*?)</h{i}>', rf'{"#" * i} \1\n\n', text, flags=re.DOTALL | re.IGNORECASE)
-    # Bold / italic
-    text = re.sub(r'<(?:strong|b)[^>]*>(.*?)</(?:strong|b)>', r'**\1**', text, flags=re.DOTALL | re.IGNORECASE)
-    text = re.sub(r'<(?:em|i)[^>]*>(.*?)</(?:em|i)>', r'*\1*', text, flags=re.DOTALL | re.IGNORECASE)
-    # Code blocks (pre + code)
-    text = re.sub(r'<pre[^>]*>\s*<code[^>]*>(.*?)</code>\s*</pre>', r'```\n\1\n```\n\n', text, flags=re.DOTALL | re.IGNORECASE)
-    # Inline code
-    text = re.sub(r'<code[^>]*>(.*?)</code>', r'`\1`', text, flags=re.DOTALL | re.IGNORECASE)
-    # Paragraphs
-    text = re.sub(r'<p[^>]*>(.*?)</p>', r'\1\n\n', text, flags=re.DOTALL | re.IGNORECASE)
-    # Line breaks
-    text = re.sub(r'<br\s*/?>', '\n', text, flags=re.IGNORECASE)
-    # Lists
-    text = re.sub(r'<li[^>]*>(.*?)</li>', r'- \1', text, flags=re.DOTALL | re.IGNORECASE)
-    text = re.sub(r'</?ul[^>]*>|</?ol[^>]*>', '', text, flags=re.IGNORECASE)
-    # Images (already handled by ResourceDownloader, but strip alt/src noise)
-    text = re.sub(r'<img[^>]*>', '', text, flags=re.IGNORECASE)
-    # Strip remaining tags
-    text = HTML_TAG_RE.sub('', text)
-    # Unescape
-    text = html.unescape(text)
-    # Collapse excessive blank lines
-    text = re.sub(r'\n{3,}', '\n\n', text)
-    return text.strip()
+def _markdownify_html(html_text: str) -> str:
+    """Convert HTML to Markdown using markdownify (handles complex HTML well)."""
+    # markdownify uses BeautifulSoup under the hood and produces high-quality
+    # Markdown for headings, lists, tables, code blocks, emphasis, etc.
+    md = markdownify.markdownify(
+        html_text,
+        heading_style="ATX",
+        strip=["script", "style"],
+    )
+    # Collapse excessive blank lines.
+    md = re.sub(r"\n{3,}", "\n\n", md)
+    return md.strip()
+
+
+# Lakesheet-specific patterns
+LAKE_SHEET_RE = re.compile(r'<div[^>]*data-lake-card=["\'][^"\']*sheet[^"\']*["\'][^>]*>.*?</div>', re.DOTALL | re.IGNORECASE)
+LAKE_SHEET_IMG_RE = re.compile(
+    r'<div[^>]*data-lake-card=["\'][^"\']*sheet[^"\']*["\'][^>]*>.*?<img\s+[^>]*src=["\']([^"\']+)["\'][^>]*>.*?</div>',
+    re.DOTALL | re.IGNORECASE,
+)
+# Pattern to extract data-value or data-content from lake card attributes.
+LAKE_CARD_DATA_RE = re.compile(r'data-(?:value|content)=["\']([^"\']+)["\']', re.IGNORECASE)
 
 
 def _handle_lake_cards(text: str, namespace: str, slug: str) -> str:
-    """Replace lake board / mind-map cards with placeholders."""
+    """Replace lake board / mind-map / sheet cards with placeholders or parsed content."""
+    source_url = f"https://www.yuque.com/{namespace}/docs/{slug}"
 
+    # 1. Lakesheet – try to parse embedded data, then image, then placeholder.
+    def _sheet_repl(m: re.Match[str]) -> str:
+        card_html = m.group(0)
+
+        # Try to extract embedded sheet data from card attributes.
+        data_match = LAKE_CARD_DATA_RE.search(card_html)
+        if data_match:
+            raw_value = html.unescape(data_match.group(1))
+            # Try to parse this as sheet data.
+            md = parse_sheet_from_raw_content(raw_value)
+            if md:
+                return f'\n{md}\n'
+            # Also try direct JSON (without the {"sheet": ...} wrapper).
+            try:
+                parsed = json.loads(raw_value)
+                if isinstance(parsed, dict) and "sheet" in parsed:
+                    md = parse_sheet_from_raw_content(raw_value)
+                    if md:
+                        return f'\n{md}\n'
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+        # Try to find an <img> inside the lake-sheet card.
+        img_match = re.search(
+            r'<img\s+[^>]*src=["\']([^"\']+)["\'][^>]*>',
+            card_html,
+            re.IGNORECASE,
+        )
+        if img_match:
+            img_url = img_match.group(1)
+            return f'> 📊 数据表（原文图片）：![sheet]({img_url})\n\n> 或查看原文：[原文]({source_url})\n\n'
+
+        # Try to find an HTML table inside the card and convert it.
+        table_match = HTML_TABLE_RE.search(card_html)
+        if table_match:
+            table_md = _convert_html_tables(card_html)
+            if table_md.strip():
+                return f'\n{table_md}\n'
+
+        return f'> 📊 数据表内容无法直接导出，请查看原文：[原文]({source_url})\n\n'
+
+    text = LAKE_SHEET_RE.sub(_sheet_repl, text)
+
+    # 2. Board / mind-map placeholders
     def _card_repl(m: re.Match[str]) -> str:
         card_html = m.group(0).lower()
-        source_url = f"https://www.yuque.com{namespace}/docs/{slug}"
         if 'board' in card_html or 'whiteboard' in card_html:
             return f'> 🎨 画板内容无法直接导出，请查看原文：[原文]({source_url})\n\n'
         if 'mindmap' in card_html or 'mind' in card_html:
@@ -355,37 +393,420 @@ def _handle_lake_cards(text: str, namespace: str, slug: str) -> str:
     return LAKE_CARD_RE.sub(_card_repl, text)
 
 
+def _looks_like_garbage(text: str) -> bool:
+    """Heuristic: does the converted text look garbled / unreadable?
+
+    We check for excessive HTML entities, stray tags, or very high ratio of
+    non-printable / markup characters.
+    """
+    if not text:
+        return True
+    stripped = text.strip()
+    if not stripped:
+        return True
+    # Lots of un-decoded HTML entities
+    if text.count('&') > 10 and re.search(r'&[a-zA-Z#0-9]+;', text):
+        return True
+    # Still contains raw <tags> after conversion
+    raw_tags = re.findall(r'<[^>]+>', text)
+    if len(raw_tags) > 5:
+        return True
+    # High ratio of data-* attributes or encoded binary (lake card remnants)
+    if 'data-lake' in text or 'data-card' in text:
+        return True
+    # Looks like compressed/binary data leak
+    non_printable = sum(1 for c in stripped[:500] if ord(c) < 32 and c not in '\n\r\t')
+    if non_printable > 10:
+        return True
+    return False
+
+
 def convert_lake_body(
     body: str,
     body_html: Optional[str],
     namespace: str,
     slug: str,
+    doc_format: Optional[str] = None,
 ) -> str:
     """Convert lake-format document body to Obsidian-compatible Markdown.
 
     Strategy:
-    1. Handle known lake cards (board / mind-map) → placeholders.
-    2. Convert any embedded HTML tables → Markdown tables.
-    3. If *body* is very short / empty and *body_html* is present, do a basic
-       HTML → Markdown conversion as fallback.
+    1. For standalone *sheet* documents (format="sheet") try markdownify on
+       body_html, but fall back to a placeholder if the output looks garbled.
+    2. For embedded lakesheets inside a Lake doc, extract any rendered image
+       or replace with a placeholder.
+    3. Replace lake cards (board / mind-map) with placeholders.
+    4. If the body is short or contains heavy HTML, convert with markdownify.
+    5. Post-process HTML tables.
     """
     if not body:
         body = ''
 
-    # Step 1: lake cards
+    source_url = f"https://www.yuque.com/{namespace}/docs/{slug}"
+
+    # ------------------------------------------------------------------
+    # Standalone sheet-type document
+    # ------------------------------------------------------------------
+    if doc_format and doc_format.lower() == "sheet":
+        # Try to parse body directly as sheet content JSON.
+        md = parse_sheet_from_raw_content(body)
+        if md:
+            return md
+        if body_html:
+            # If the HTML contains a lakesheet card, try to grab the image.
+            img_match = LAKE_SHEET_IMG_RE.search(body_html)
+            if img_match:
+                img_url = img_match.group(1)
+                return f"> 📊 数据表（原文图片）：![sheet]({img_url})\n\n> 或查看原文：[原文]({source_url})\n\n"
+            # Otherwise attempt markdownify, but guard against garbage.
+            md = _markdownify_html(body_html)
+            if not _looks_like_garbage(md):
+                return md
+        return f"> 📊 数据表内容无法直接导出，请查看原文：[原文]({source_url})\n\n"
+
+    # ------------------------------------------------------------------
+    # Normal Lake doc (may contain embedded lakesheets, boards, etc.)
+    # ------------------------------------------------------------------
+
+    # Step 1: lakesheet JSON detection — try both the old format and the
+    # new compressed format from the unofficial API.
+    _sheet_json = _try_extract_lakesheet(body)
+    if _sheet_json is not None:
+        return _sheet_json
+    _sheet_compressed = parse_sheet_from_raw_content(body)
+    if _sheet_compressed is not None:
+        return _sheet_compressed
+
+    # Step 2: replace known lake cards with placeholders.
     body = _handle_lake_cards(body, namespace, slug)
 
-    # Step 2: HTML tables inside markdown body
-    body = _convert_html_tables(body)
+    # Step 3: decide whether we need heavy HTML→Markdown conversion.
+    body_stripped = body.strip()
+    has_substantial_html = body.count('<') > 5 and '<div' in body.lower()
+    needs_conversion = len(body_stripped) < 100 or has_substantial_html
 
-    # Step 3: fallback to body_html when body is basically empty
-    if body_html and len(body.strip()) < 100:
-        body = _basic_html_to_markdown(body_html)
-        # Re-apply table conversion on the converted text as well.
-        body = _convert_html_tables(body)
+    if needs_conversion and body_html:
+        # Use markdownify for robust HTML→Markdown conversion.
+        body = _markdownify_html(body_html)
+        # Re-apply card placeholders (markdownify preserves blockquote text).
         body = _handle_lake_cards(body, namespace, slug)
 
+    # Step 4: fix up tables that markdownify may have left with quirks.
+    body = _convert_html_tables(body)
+
     return body
+
+
+def _try_extract_lakesheet(body: str) -> Optional[str]:
+    """Detect and convert a lakesheet (data-table) JSON payload to Markdown.
+
+    Yuque lakesheet documents sometimes store the table data as JSON inside
+    the body.  If we find a recognisable sheet structure we convert it to a
+    Markdown table; otherwise return None so normal processing continues.
+    """
+    text = body.strip()
+    if not text.startswith('{'):
+        return None
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+
+    # Look for sheet data in a few known shapes.
+    sheet = data.get('sheet') or data.get('data', {}).get('sheet')
+    if not sheet:
+        return None
+
+    # sheet may be a dict with headers + rows, or a list of rows.
+    headers: list[str] = []
+    rows: list[list[str]] = []
+
+    if isinstance(sheet, dict):
+        headers = [str(h) for h in sheet.get('header', [])]
+        for row in sheet.get('rows', []):
+            if isinstance(row, dict):
+                rows.append([str(row.get(h, '')) for h in headers])
+            elif isinstance(row, list):
+                rows.append([str(c) for c in row])
+    elif isinstance(sheet, list) and sheet:
+        first = sheet[0]
+        if isinstance(first, dict):
+            headers = list(first.keys())
+            for row in sheet:
+                rows.append([str(row.get(h, '')) for h in headers])
+        elif isinstance(first, list):
+            headers = [str(c) for c in first]
+            for row in sheet[1:]:
+                rows.append([str(c) for c in row])
+
+    if not headers:
+        return None
+
+    lines = ['| ' + ' | '.join(headers) + ' |']
+    lines.append('| ' + ' | '.join(['---'] * len(headers)) + ' |')
+    for row in rows:
+        lines.append('| ' + ' | '.join(row) + ' |')
+    return '\n'.join(lines) + '\n'
+
+
+def parse_sheet_from_raw_content(content_str: Optional[str]) -> Optional[str]:
+    """Parse a sheet/table document body into Markdown.
+
+    Handles two Yuque formats:
+
+    1. **lakesheet** — body is JSON like::
+
+        {"format": "lakesheet", "sheet": "<zlib-compressed>", ...}
+
+       The compressed data inflates to::
+
+        [{"name": "Sheet1", "data": {row: {col: {"v": value}}}, ...}]
+
+    2. **laketable** — body is JSON like::
+
+        {"format": "laketable", "sheet": [{"columns": [...], "views": {...}}], ...}
+
+       This is a structured database-like table with column definitions.
+
+    Returns Markdown table(s) on success, or None if parsing fails.
+    """
+    if not content_str:
+        return None
+
+    try:
+        content = json.loads(content_str)
+    except (json.JSONDecodeError, TypeError):
+        return None
+
+    if not isinstance(content, dict):
+        return None
+
+    fmt = (content.get("format") or "").lower()
+    sheet_data = content.get("sheet")
+    if not sheet_data:
+        return None
+
+    # --- laketable: structured column definitions ---
+    if fmt == "laketable" and isinstance(sheet_data, list):
+        return _parse_laketable(sheet_data)
+
+    # --- lakesheet: compressed row/col data ---
+    sheet_items = _decompress_sheet(sheet_data)
+    if not sheet_items:
+        return None
+
+    # Convert each sheet item to a Markdown table.
+    parts: list[str] = []
+    for item in sheet_items:
+        name = item.get("name", "Sheet")
+        data = item.get("data")
+        if not data:
+            continue
+        table_md = _sheet_data_to_markdown(data)
+        if table_md:
+            parts.append(f"## {name}\n\n{table_md}")
+
+    return "\n\n".join(parts) if parts else None
+
+
+def _parse_laketable(sheet_list: list) -> Optional[str]:
+    """Parse a laketable sheet list into Markdown.
+
+    Laketable has column definitions but the actual row data is often empty
+    in the body (it's loaded dynamically). We output the table structure
+    (column names and types) so it's at least readable.
+    """
+    parts: list[str] = []
+    for sheet_item in sheet_list:
+        columns = sheet_item.get("columns", [])
+        if not columns:
+            continue
+
+        # Build a header row from column definitions.
+        headers = [col.get("name", "?") for col in columns]
+        lines = ['| ' + ' | '.join(headers) + ' |']
+        lines.append('| ' + ' | '.join(['---'] * len(headers)) + ' |')
+
+        # Check if there's any row data in views.
+        views = sheet_item.get("views", {})
+        rows_found = False
+        for view in views.values():
+            if isinstance(view, dict):
+                view_rows = view.get("rows", [])
+                if view_rows:
+                    rows_found = True
+                    col_ids = [col.get("id", "") for col in columns]
+                    for row in view_rows:
+                        if isinstance(row, dict):
+                            cells = []
+                            for cid in col_ids:
+                                cell_val = row.get(cid, "")
+                                cells.append(_format_cell_value(cell_val))
+                            lines.append('| ' + ' | '.join(cells) + ' |')
+                    break
+
+        if not rows_found:
+            # Add a note that data loads dynamically.
+            type_row = [col.get("type", "") for col in columns]
+            lines.append('| ' + ' | '.join(f"*{t}*" for t in type_row) + ' |')
+
+        parts.append('\n'.join(lines) + '\n')
+
+    return "\n\n".join(parts) if parts else None
+
+
+def _decompress_sheet(sheet_data: Any) -> Optional[list[dict]]:
+    """Decompress and parse sheet data (zlib-compressed string or already parsed)."""
+    # Already parsed (unlikely but handle gracefully).
+    if isinstance(sheet_data, list):
+        return sheet_data
+
+    if not isinstance(sheet_data, str):
+        return None
+
+    # Try different decompression strategies.
+    raw_bytes: Optional[bytes] = None
+
+    # Strategy 1: It might be base64-encoded zlib data.
+    try:
+        decoded = base64.b64decode(sheet_data)
+        raw_bytes = zlib.decompress(decoded)
+    except Exception:
+        pass
+
+    # Strategy 2: Raw binary string (pako-style, latin-1 encoded).
+    if raw_bytes is None:
+        try:
+            raw_bytes = zlib.decompress(sheet_data.encode("latin-1"))
+        except Exception:
+            pass
+
+    # Strategy 3: Raw zlib with wbits variations.
+    if raw_bytes is None:
+        for wbits in (15, -15, 31, 47):
+            try:
+                raw_bytes = zlib.decompress(sheet_data.encode("latin-1"), wbits)
+                break
+            except Exception:
+                continue
+
+    # Strategy 4: Maybe it's just JSON directly (uncompressed).
+    if raw_bytes is None:
+        try:
+            parsed = json.loads(sheet_data)
+            if isinstance(parsed, list):
+                return parsed
+        except (json.JSONDecodeError, TypeError):
+            pass
+        return None
+
+    # Parse the decompressed JSON.
+    try:
+        parsed = json.loads(raw_bytes.decode("utf-8"))
+        if isinstance(parsed, list):
+            return parsed
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        pass
+
+    return None
+
+
+def _sheet_data_to_markdown(data: dict) -> str:
+    """Convert a single sheet's row/col data dict to a Markdown table.
+
+    The data structure is: {row_index: {col_index: {"v": value}}}
+    where row_index and col_index are string-encoded integers.
+    """
+    if not data:
+        return ""
+
+    # Determine grid dimensions.
+    row_indices: list[int] = []
+    col_indices: list[int] = []
+    for row_key, cols in data.items():
+        try:
+            row_indices.append(int(row_key))
+        except (ValueError, TypeError):
+            continue
+        if isinstance(cols, dict):
+            for col_key in cols:
+                try:
+                    col_indices.append(int(col_key))
+                except (ValueError, TypeError):
+                    continue
+
+    if not row_indices or not col_indices:
+        return ""
+
+    # Filter out completely empty rows.
+    non_empty_rows: list[int] = []
+    for row_idx in sorted(set(row_indices)):
+        row_data = data.get(str(row_idx), {})
+        if isinstance(row_data, dict) and any(
+            row_data.get(str(c), {}).get("v") for c in sorted(set(col_indices))
+        ):
+            non_empty_rows.append(row_idx)
+
+    if not non_empty_rows:
+        return ""
+
+    col_max = max(col_indices)
+    all_cols = list(range(col_max + 1))
+
+    # Build rows.
+    md_rows: list[list[str]] = []
+    for row_idx in non_empty_rows:
+        row_data = data.get(str(row_idx), {})
+        cells: list[str] = []
+        for col_idx in all_cols:
+            cell = row_data.get(str(col_idx), {}) if isinstance(row_data, dict) else {}
+            cells.append(_format_cell_value(cell.get("v") if isinstance(cell, dict) else None))
+        md_rows.append(cells)
+
+    if not md_rows:
+        return ""
+
+    # Use first row as header.
+    header = md_rows[0]
+    lines = ['| ' + ' | '.join(header) + ' |']
+    lines.append('| ' + ' | '.join(['---'] * len(header)) + ' |')
+    for row in md_rows[1:]:
+        # Pad or truncate to match header length.
+        padded = row + [''] * (len(header) - len(row))
+        lines.append('| ' + ' | '.join(padded[:len(header)]) + ' |')
+
+    return '\n'.join(lines) + '\n'
+
+
+def _format_cell_value(v: Any) -> str:
+    """Format a sheet cell value to Markdown-safe text."""
+    if v is None:
+        return ""
+    if isinstance(v, str):
+        # Escape pipe characters that would break table formatting.
+        return v.replace("|", "\\|").replace("\n", " ")
+    if isinstance(v, (int, float)):
+        return str(v)
+    if isinstance(v, dict):
+        cls = v.get("class", "")
+        if cls == "image" and v.get("src"):
+            return f"![{v.get('name', '')}]({v['src']})"
+        if cls == "checkbox":
+            return "[x]" if v.get("value") else "[ ]"
+        if cls == "link":
+            return f"[{v.get('text', '')}]({v.get('url', '')})"
+        if cls == "select":
+            values = v.get("value", [])
+            return ", ".join(values) if isinstance(values, list) else str(values)
+        # Fallback: try to extract text.
+        if "text" in v:
+            return str(v["text"])
+        if "v" in v:
+            return _format_cell_value(v["v"])
+    if isinstance(v, list):
+        # Some cells have array values.
+        return ", ".join(_format_cell_value(item) for item in v)
+    return str(v)
 
 
 # ---------------------------------------------------------------------------
@@ -404,7 +825,7 @@ def build_frontmatter(doc: DocDetail, namespace: str, config: Config) -> str:
         lines.append(f"modified: {doc.updated_at.isoformat()}")
 
     if config.frontmatter.include_source_url:
-        source = f"https://www.yuque.com{namespace}/docs/{doc.slug}"
+        source = f"https://www.yuque.com/{namespace}/docs/{doc.slug}"
         lines.append(f"source: {source}")
 
     if doc.format:
@@ -464,7 +885,7 @@ async def process_markdown(
 
     # 1. Lake format conversion (画板 / 思维导图 / 表格等)
     if doc.format and doc.format.lower() == "lake":
-        body = convert_lake_body(body, doc.body_html, namespace, doc.slug)
+        body = convert_lake_body(body, doc.body_html, namespace, doc.slug, doc.format)
 
     # 2. Rewrite Yuque internal doc links → Obsidian [[...]] links
     body = rewrite_internal_links(body, namespace, slug_to_path, resolve_link)
