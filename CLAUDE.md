@@ -66,6 +66,20 @@ Auth Header: `X-Auth-Token: <token>`
 
 `namespace` 格式：`/{login}/{repo_slug}` 或 `/{group_login}/{repo_slug}`
 
+### 与社区方案的 API 对比
+
+社区常见的非官方方案（如 yuque-dl、yuque-tools、yuque-crawl）使用语雀 Web/内部 API，例如：
+
+| 端点 | 用途 | 来源 |
+|------|------|------|
+| `GET /api/mine/book_stacks` | 个人知识库列表 | yuque-tools |
+| `GET /api/docs/{slug}?book_id={id}&mode=markdown` | Markdown 源码 | yuque-dl, yuque-crawl |
+| `GET /api/comments/floor?commentable_type=Doc&...` | 评论 | yuque-tools |
+| `GET /api/modules/note/notes/NoteController/index?...` | 小记导出 | yuque-tools |
+| `GET /api/filetransfer/images?url=...&sign=...` | 图片代理/去水印 | yuque-dl |
+
+**我们的策略**：以官方 API v2 为主干（稳定、可持续），上述非官方端点可作为后续可选扩展模块接入，不改动现有核心链路。
+
 ## 核心数据流
 
 1. `GET /user` 获取当前用户 `login`
@@ -78,7 +92,7 @@ Auth Header: `X-Auth-Token: <token>`
    - 检查 SQLite 中的 `content_updated_at`，跳过未变更文档（增量同步）
    - `GET /repos/{namespace}/docs/{slug}` 获取 `body`（Markdown）
    - 解析 Markdown 中的图片/附件链接
-   - 异步下载到 `assets/`，去重（URL hash 命名）
+   - 异步下载到对应知识库的 `{repo_name}/assets/` 目录，去重（URL hash 命名）
    - 替换 Markdown 链接为相对路径
    - 生成 Obsidian frontmatter
    - 写入 `.md` 文件
@@ -106,7 +120,7 @@ SQLite 表 `docs` 以 `(namespace, slug)` 为主键，记录 `title`、`content_
 文件命名：`{hash}_{sanitized_name}.{ext}`，保留中文。
 
 相对路径根据文档在 Vault 中的深度自动计算，例如：
-- 文档在 `Vault/知识库/目录A/文档.md` → 图片链接为 `../../assets/xxx.png`
+- 文档在 `Vault/知识库/目录A/文档.md` → 图片链接为 `../assets/xxx.png`（assets 与知识库同级）
 
 ## TOC 目录映射
 
@@ -177,31 +191,45 @@ python ui.py --config config.yaml
 | `models.py` | `User`、`Repo`、`DocSummary`、`DocDetail`、`TocNode`、`Group`、`SyncState` |
 | `storage.py` | SQLite 状态：`docs`、`repos`、`sync_log` 三张表 |
 | `toc.py` | 解析 TOC 扁平数组为树，生成文件相对路径，文件名安全化 |
-| `markdown_processor.py` | 扫描 Markdown/HTML 中的外链，下载图片/附件，替换为相对路径，生成 frontmatter |
-| `exporter.py` | 编排整个导出流程，错误收集，统计报告 |
+| `markdown_processor.py` | 扫描 Markdown/HTML 中的外链，下载图片/附件，替换为相对路径，生成 frontmatter；语雀内部链接→`[[...]]`；Lake 格式转换 |
+| `exporter.py` | 编排整个导出流程，错误收集，统计报告；维护跨知识库链接解析缓存 |
 | `main.py` | CLI 入口 |
 | `ui.py` | Gradio Web UI 入口 |
 
-## 已知问题与注意点
+## 新增功能说明
 
-1. **huggingface-hub 版本兼容性**：Gradio 4.x 需要 `huggingface-hub<0.25`，已在 `requirements.txt` 中固定。
-2. **Windows 控制台中文显示**：终端可能显示乱码，但生成的文件、文件夹名、数据库内容都是正确 UTF-8，在 Obsidian 中正常。
-3. **API 限流**：语雀约 5000 次/小时，工具已做限流和重试。大量文档首次导出可能较慢。
-4. **图片防盗链**：部分 `cdn.nlark.com` 图片可能需登录态/Referer，下载失败会记录到 `failed_downloads.json`。
-5. **语雀内部链接**：当前保留原始 URL，未自动替换为 Obsidian `[[...]]` 链接。
+### 语雀内部文档链接 → Obsidian `[[...]]`
 
-## 扩展方向
-
-- 语雀内部文档链接替换为 Obsidian 内部链接 `[[...]]`
-- 画板/思维导图的 Lake 格式深度转换
-- 评论导出
-- 双向同步（Obsidian → 语雀）
+- 在 `markdown_processor.py` 中通过 `rewrite_internal_links` 实现。
+- 识别 `https://www.yuque.com/{namespace}/docs/{slug}` 形式的链接。
+- **同知识库链接**：利用 `_sync_repo` 阶段构建的 `slug_to_path` 字典即时解析。
+- **跨知识库链接**：通过 `Exporter._resolve_doc_link` 查询 SQLite `docs` 表中的 `file_path`；结果缓存于 `_link_cache` 避免重复查库。
+- 若目标文档尚未导出（无状态记录），保留原始 URL 不替换。
+- 同时支持 Markdown `[text](url)` 和 HTML `<a href=
 
 ## 测试验证历史
 
 已通过模拟 API 的端到端测试验证：
 - 文档按 TOC 层级正确生成到 `知识库/目录A/文档.md`
-- 图片正确下载到 `assets/` 并替换为 `../../assets/xxx.png`
+- 图片正确下载到各知识库的 `assets/` 并替换为相对路径（如 `../assets/xxx.png`）
 - 增量同步时未变更文档会跳过，`get_doc_detail` 不会被调用
 - SQLite 状态正常记录
 - 中文字符在生成的文件、文件夹名、数据库中均正确保留
+- 语雀内部链接正确替换为 `[[...]]`（同知识库 + 跨知识库）
+- Lake 格式文档的 HTML 表格正确转为 Markdown 表格，画板/思维导图生成占位提示
+
+### Lake 格式转换
+
+在 `markdown_processor.py` 中通过 `convert_lake_body` 实现：
+
+1. **画板 / 思维导图**：检测 `data-lake-card` 标记，替换为包含原文链接的占位块引用（`> 🎨 ...` / `> 🧠 ...`）。
+2. **表格**：通过正则提取 HTML `<table>` 结构，转换为标准 Markdown 表格（含 `---` 分隔行）。
+3. **fallback**：当 `body` 过短（< 100 字符）且 `body_html` 存在时，使用 `_basic_html_to_markdown` 进行轻量级 HTML → Markdown 转换（支持 headings、lists、code blocks、bold/italic 等常见标签）。
+4. 转换后的 `format: lake` 会写入 YAML frontmatter。
+
+## 扩展方向
+
+- ✅ 语雀内部文档链接替换为 Obsidian 内部链接 `[[...]]`
+- ✅ 画板/思维导图的 Lake 格式深度转换
+- 评论导出（需接入非官方 `/api/comments/floor` 端点）
+- 双向同步（Obsidian → 语雀）
