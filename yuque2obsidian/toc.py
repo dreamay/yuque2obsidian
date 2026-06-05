@@ -64,7 +64,11 @@ class TocTree:
         doc_title: str,
         repo_name: str,
     ) -> Optional[Path]:
-        """Compute relative file path for a doc within the repo."""
+        """Compute relative file path for a doc within the repo.
+
+        If a DOC node has children, place the doc itself inside a folder
+        with the same name so that child docs live alongside the parent.
+        """
         node = self._by_doc_id.get(doc_id)
         parts = [sanitize_filename(repo_name)]
         if node is not None:
@@ -73,7 +77,12 @@ class TocTree:
                 if p.title:
                     parts.append(sanitize_filename(p.title))
             title = node.title or doc_title
-            parts.append(sanitize_filename(title) + ".md")
+            safe_title = sanitize_filename(title)
+            # If this DOC node has children, nest the doc inside a folder
+            # named after itself so child docs live in the same folder.
+            if node.type == "DOC" and node.uuid in self._children:
+                parts.append(safe_title)
+            parts.append(safe_title + ".md")
         else:
             parts.append(sanitize_filename(doc_title) + ".md")
         return Path(*parts)
